@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import hashlib
 import re
 import sys
 import time
 import random
 import json
+from urllib.parse import urlparse
 from pathlib import Path
 
 import requests
@@ -72,6 +74,40 @@ def parse_args() -> argparse.Namespace:
         help="Path to a text file with one email per line (API mode only).",
     )
     parser.add_argument(
+        "-u",
+        "--username",
+        required=False,
+        help="Username to search via LeakRadar API (API mode only).",
+    )
+    parser.add_argument(
+        "-ul",
+        "--username-list",
+        required=False,
+        help="Path to a text file with one username per line (API mode only).",
+    )
+    parser.add_argument(
+        "-p",
+        "--hash",
+        "--password",
+        required=False,
+        dest="hash",
+        help="Plaintext credential/password to search (auto-hashed to SHA-1 and checked via LeakRadar /password-range).",
+    )
+    parser.add_argument(
+        "--hash-list",
+        "--password-list",
+        required=False,
+        dest="hash_list",
+        help="Path to a text file with one plaintext credential/password per line.",
+    )
+    parser.add_argument(
+        "--category",
+        required=False,
+        choices=["employees", "customers", "third_parties", "all"],
+        default="all",
+        help="Domain search category filter: employees, customers, third_parties, or all (default: all).",
+    )
+    parser.add_argument(
         "--tenant",
         action="store_true",
         help="Expand domain(s) using tenant-domains and search all discovered domains.",
@@ -82,9 +118,15 @@ def parse_args() -> argparse.Namespace:
         help="API mode only: auto-unlock locked items on each page (consumes points).",
     )
     parser.add_argument(
+        "--limit",
+        type=int,
+        default=50000,
+        help="API mode only: maximum number of result rows to write (default: 50000).",
+    )
+    parser.add_argument(
         "--key",
         default=str(DEFAULT_KEY_PATH),
-        help="API mode only: path to LeakRadar API key file (default: ./key.txt).",
+        help="API mode only: path to LeakRadar API key file (default: ./keys.txt).",
     )
     parser.add_argument(
         "-v",
@@ -209,7 +251,7 @@ def read_api_key(path: Path) -> str:
     return key
 
 
-def fetch_domain_leaks(domain: str, api_key: str, auto_unlock: bool) -> tuple[list[dict], int]:
+def fetch_domain_leaks(domain: str, api_key: str, auto_unlock: bool, category: str = "all") -> tuple[list[dict], int]:
     headers = {"Authorization": f"Bearer {api_key}"}
     page = 1
     page_size = 1000
@@ -221,7 +263,7 @@ def fetch_domain_leaks(domain: str, api_key: str, auto_unlock: bool) -> tuple[li
         if auto_unlock:
             params["auto_unlock"] = "true"
 
-        url = f"{API_BASE_URL}/search/domain/{domain}/all"
+        url = f"{API_BASE_URL}/search/domain/{domain}/{category}"
         if VERBOSE:
             print(f"[domain] {domain} page={page} page_size={page_size}", file=sys.stderr)
         response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
@@ -291,6 +333,84 @@ def fetch_ip_leaks(ip: str, api_key: str, auto_unlock: bool) -> tuple[list[dict]
 
     return all_items, points_consumed
 
+
+def fetch_password_hashes(password: str, api_key: str) -> list[dict]:
+    """Hash password to SHA-1, call /password-range, return matching hash rows."""
+    sha1 = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    prefix = sha1[:5]
+    suffix = sha1[5:]
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = f"{API_BASE_URL}/password-range"
+    params = {"prefix": prefix, "suffix_only": "false"}
+    if VERBOSE:
+        print(f"[password] '{password}' -> SHA1={sha1} prefix={prefix}", file=sys.stderr)
+    response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    data = response.json()
+    hashes = data.get("hashes", [])
+    # Find the exact match for this password's full hash
+    results = []
+    for entry in hashes:
+        h = entry.get("hash", "").upper()
+        if h == sha1:
+            results.append({
+                "PASSWORD": password,
+                "SHA1_HASH": sha1,
+                "COUNT": entry.get("count", 0),
+            })
+            break
+    if not results:
+        results.append({
+            "PASSWORD": password,
+            "SHA1_HASH": sha1,
+            "COUNT": 0,
+        })
+    return results
+
+def fetch_password_leaks(
+    password: str, api_key: str, auto_unlock: bool, limit: int | None
+) -> tuple[list[dict], int]:
+    """Search by plaintext password via /search/advanced, returning leak items."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    page = 1
+    page_size = 1000
+    all_items: list[dict] = []
+    points_consumed = 0
+
+    while True:
+        params = {"page": page, "page_size": page_size}
+        if auto_unlock:
+            params["auto_unlock"] = "true"
+
+        url = f"{API_BASE_URL}/search/advanced"
+        payload = {"password": [password]}
+        if VERBOSE:
+            print(f"[password] page={page} page_size={page_size} filter=password", file=sys.stderr)
+        response = requests.post(
+            url, headers=headers, params=params, json=payload, timeout=REQUEST_TIMEOUT
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        items = data.get("items", [])
+        all_items.extend(items)
+
+        points = data.get("auto_unlock_points_consumed")
+        if isinstance(points, int):
+            points_consumed += points
+
+        total = data.get("total")
+        if limit is not None and len(all_items) >= limit:
+            all_items = all_items[:limit]
+            break
+        if total is not None and len(all_items) >= total:
+            break
+        if not items or len(items) < page_size:
+            break
+
+        page += 1
+
+    return all_items, points_consumed
 
 def fetch_email_leaks(email: str, api_key: str, auto_unlock: bool) -> tuple[list[dict], int]:
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -535,7 +655,7 @@ def build_report_from_csv(
 
 
 def build_report_from_api(
-    domains: list[str], api_key: str, auto_unlock: bool
+    domains: list[str], api_key: str, auto_unlock: bool, category: str = "all"
 ) -> tuple[list[dict[str, str]], list[str], int]:
     all_rows: list[dict[str, str]] = []
     all_columns: list[str] = []
@@ -545,7 +665,7 @@ def build_report_from_api(
     for domain in domains:
         if VERBOSE:
             print(f"[domain] start {domain}", file=sys.stderr)
-        items, points_consumed = fetch_domain_leaks(domain, api_key, auto_unlock)
+        items, points_consumed = fetch_domain_leaks(domain, api_key, auto_unlock, category)
         total_points += points_consumed
         for item in items:
             username_value = item.get("username") or item.get("username_masked") or ""
@@ -647,6 +767,114 @@ def build_report_from_email(
     return all_rows, all_columns, total_points
 
 
+def build_report_from_username(
+    usernames: list[str], api_key: str, auto_unlock: bool
+) -> tuple[list[dict[str, str]], list[str], int]:
+    """Username lookup — reuses fetch_email_leaks (same POST /search/email endpoint)."""
+    all_rows: list[dict[str, str]] = []
+    all_columns: list[str] = []
+    cache: dict[str, dict[str, str]] = {}
+    total_points = 0
+
+    for username in usernames:
+        if VERBOSE:
+            print(f"[username] start {username}", file=sys.stderr)
+        items, points_consumed = fetch_email_leaks(username, api_key, auto_unlock)
+        total_points += points_consumed
+        for item in items:
+            username_value = item.get("username") or item.get("username_masked") or username
+            row_data = {
+                "DOMAIN": "",
+                "CATEGORY": item.get("category", ""),
+                "SEARCHED_USERNAME": username,
+                "URL": item.get("url", ""),
+                "USERNAME": username_value,
+                "PASSWORD": item.get("password", ""),
+                "ADDED_AT": item.get("added_at", ""),
+            }
+
+            for key in row_data.keys():
+                if key not in all_columns:
+                    all_columns.append(key)
+
+            is_email_hint = item.get("is_email", False)
+            row_data.update(
+                enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
+            )
+            all_rows.append(row_data)
+
+    return all_rows, all_columns, total_points
+
+
+def build_report_from_password(
+    passwords: list[str], api_key: str, auto_unlock: bool, limit: int | None
+) -> tuple[list[dict[str, str]], list[str], int]:
+    """For each plaintext password, compute SHA1+range count and fetch affected leak items."""
+    all_rows: list[dict[str, str]] = []
+    columns: list[str] = []
+    total_points = 0
+
+    for password in passwords:
+        pwd = (password or "").strip()
+        if not pwd:
+            continue
+
+        sha1 = hashlib.sha1(pwd.encode("utf-8")).hexdigest().upper()
+        range_rows = fetch_password_hashes(pwd, api_key)
+        count = range_rows[0].get("COUNT", 0) if range_rows else 0
+
+        items, points_consumed = fetch_password_leaks(pwd, api_key, auto_unlock, limit)
+        total_points += points_consumed
+
+        if not items:
+            row = {
+                "DOMAIN": "",
+                "CATEGORY": "",
+                "URL": "",
+                "USERNAME": "",
+                "PASSWORD": "",
+                "ADDED_AT": "",
+                "SEARCHED_PASSWORD": pwd,
+                "SHA1_HASH": sha1,
+                "COUNT": count,
+            }
+            for key in row.keys():
+                if key not in columns:
+                    columns.append(key)
+            all_rows.append(row)
+            continue
+
+        for item in items:
+            url_value = item.get("url", "") or ""
+            domain_value = ""
+            try:
+                parsed = urlparse(url_value)
+                domain_value = parsed.hostname or ""
+            except Exception:
+                domain_value = ""
+
+            username_value = item.get("username") or item.get("username_masked") or ""
+            row = {
+                "DOMAIN": domain_value,
+                "CATEGORY": item.get("category", ""),
+                "URL": url_value,
+                "USERNAME": username_value,
+                "PASSWORD": item.get("password", ""),
+                "ADDED_AT": item.get("added_at", ""),
+                "SEARCHED_PASSWORD": pwd,
+                "SHA1_HASH": sha1,
+                "COUNT": count,
+            }
+            for key in row.keys():
+                if key not in columns:
+                    columns.append(key)
+            all_rows.append(row)
+        if limit is not None and len(all_rows) >= limit:
+            all_rows = all_rows[:limit]
+            break
+
+    return all_rows, columns, total_points
+
 def build_headers(columns: list[str]) -> list[str]:
     ordered_headers = [
         "DOMAIN",
@@ -664,7 +892,7 @@ def build_headers(columns: list[str]) -> list[str]:
         ordered_headers.insert(2, "IP")
     if "EMAIL" in columns:
         ordered_headers.insert(2, "EMAIL")
-    headers = [h for h in ordered_headers if h in ordered_headers]
+    headers = [h for h in ordered_headers if h in columns]
     extra_columns = [c for c in columns if c not in headers]
     headers.extend(extra_columns)
     return headers
@@ -740,9 +968,21 @@ def main() -> int:
         elif args.email:
             email_filters = [args.email.strip()]
 
+        username_filters: list[str] | None = None
+        if args.username_list:
+            username_filters = read_email_list(Path(args.username_list).expanduser().resolve())
+        elif args.username:
+            username_filters = [args.username.strip()]
+
+        hash_list: list[str] | None = None
+        if args.hash_list:
+            hash_list = read_email_list(Path(args.hash_list).expanduser().resolve())
+        elif args.hash:
+            hash_list = [args.hash]
+
         if args.folder:
             folder = Path(args.folder).expanduser().resolve()
-        elif not domain_filters and not ip_filters and not email_filters:
+        elif not domain_filters and not ip_filters and not email_filters and not username_filters and not hash_list:
             default_folder = Path.cwd() / "files"
             folder = default_folder if default_folder.exists() else Path.cwd()
 
@@ -776,16 +1016,18 @@ def main() -> int:
             bool(domain_filters),
             bool(ip_filters),
             bool(email_filters),
+            bool(username_filters),
+            bool(hash_list),
         ])
         if active_modes == 0:
             print(
-                "Error: Provide -ff for CSV mode or -d/-dl/-i/-il/-e/-el for API mode.",
+                "Error: Provide -ff for CSV mode or -d/-dl/-i/-il/-e/-el/-u/-ul/-p/--hash-list for API mode.",
                 file=sys.stderr,
             )
             return 1
         if active_modes > 1:
             print(
-                "Error: Choose only one search mode: domain (-d/-dl), IP (-i/-il), or email (-e/-el).",
+                "Error: Choose only one search mode at a time.",
                 file=sys.stderr,
             )
             return 1
@@ -793,9 +1035,9 @@ def main() -> int:
         api_key = read_api_key(Path(args.key).expanduser().resolve())
         if domain_filters:
             rows, columns, points_consumed = build_report_from_api(
-                domain_filters, api_key, args.auto_unlock
+                domain_filters, api_key, args.auto_unlock, args.category
             )
-            summary = f"{len(domain_filters)} domain(s)"
+            summary = f"{len(domain_filters)} domain(s) [{args.category}]"
             if len(domain_filters) > 1:
                 write_report_by_domain(output, rows, columns)
             else:
@@ -806,12 +1048,27 @@ def main() -> int:
             )
             summary = f"{len(ip_filters)} IP(s)"
             write_report(output, rows, columns)
-        else:
+        elif email_filters:
             rows, columns, points_consumed = build_report_from_email(
-                email_filters or [], api_key, args.auto_unlock
+                email_filters, api_key, args.auto_unlock
             )
-            summary = f"{len(email_filters or [])} email(s)"
+            summary = f"{len(email_filters)} email(s)"
             write_report(output, rows, columns)
+        elif username_filters:
+            rows, columns, points_consumed = build_report_from_username(
+                username_filters, api_key, args.auto_unlock
+            )
+            summary = f"{len(username_filters)} username(s)"
+            write_report(output, rows, columns)
+        else:
+            # hash mode
+            rows, columns, points_consumed = build_report_from_password(
+                hash_list or [], api_key, args.auto_unlock, args.limit
+            )
+            summary = f"{len(hash_list or [])} hash lookup(s)"
+            write_report(output, rows, columns)
+            print(f"Done: checked {len(rows)} credential/password hash(es). Results in {output}")
+            return 0
 
         if args.auto_unlock:
             note = f"Auto-unlock points consumed: {points_consumed}"
