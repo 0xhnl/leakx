@@ -60,6 +60,18 @@ def parse_args() -> argparse.Namespace:
         help="Path to a text file with one IP per line (API mode only).",
     )
     parser.add_argument(
+        "-e",
+        "--email",
+        required=False,
+        help="Email address to search via LeakRadar API (API mode only).",
+    )
+    parser.add_argument(
+        "-el",
+        "--email-list",
+        required=False,
+        help="Path to a text file with one email per line (API mode only).",
+    )
+    parser.add_argument(
         "--tenant",
         action="store_true",
         help="Expand domain(s) using tenant-domains and search all discovered domains.",
@@ -280,6 +292,47 @@ def fetch_ip_leaks(ip: str, api_key: str, auto_unlock: bool) -> tuple[list[dict]
     return all_items, points_consumed
 
 
+def fetch_email_leaks(email: str, api_key: str, auto_unlock: bool) -> tuple[list[dict], int]:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    page = 1
+    page_size = 100  # /search/email max page_size is 100
+    all_items: list[dict] = []
+    points_consumed = 0
+
+    while True:
+        params = {"page": page, "page_size": page_size}
+        if auto_unlock:
+            params["auto_unlock"] = "true"
+
+        url = f"{API_BASE_URL}/search/email"
+        payload = {"email": email}
+        if VERBOSE:
+            print(f"[email] {email} page={page} page_size={page_size}", file=sys.stderr)
+        response = requests.post(url, headers=headers, params=params, json=payload, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+
+        items = data.get("items", [])
+        all_items.extend(items)
+        if VERBOSE:
+            total = data.get("total")
+            print(f"[email] {email} got {len(items)} items (total={total})", file=sys.stderr)
+
+        points = data.get("auto_unlock_points_consumed")
+        if isinstance(points, int):
+            points_consumed += points
+
+        total = data.get("total")
+        if total is not None and len(all_items) >= total:
+            break
+        if not items or len(items) < page_size:
+            break
+
+        page += 1
+
+    return all_items, points_consumed
+
+
 def autosize_columns(ws, headers: list[str]) -> None:
     for idx, header in enumerate(headers, start=1):
         max_len = len(str(header))
@@ -343,6 +396,15 @@ def read_ip_list(path: Path) -> list[str]:
         if value and not value.startswith("#"):
             ips.append(value)
     return ips
+
+
+def read_email_list(path: Path) -> list[str]:
+    emails: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        value = line.strip()
+        if value and not value.startswith("#"):
+            emails.append(value)
+    return emails
 
 
 def expand_tenant_domains(domains: list[str]) -> list[str]:
@@ -547,6 +609,44 @@ def build_report_from_ip(
     return all_rows, all_columns, total_points
 
 
+def build_report_from_email(
+    emails: list[str], api_key: str, auto_unlock: bool
+) -> tuple[list[dict[str, str]], list[str], int]:
+    all_rows: list[dict[str, str]] = []
+    all_columns: list[str] = []
+    cache: dict[str, dict[str, str]] = {}
+    total_points = 0
+
+    for email in emails:
+        if VERBOSE:
+            print(f"[email] start {email}", file=sys.stderr)
+        items, points_consumed = fetch_email_leaks(email, api_key, auto_unlock)
+        total_points += points_consumed
+        for item in items:
+            username_value = item.get("username") or item.get("username_masked") or email
+            row_data = {
+                "DOMAIN": "",
+                "CATEGORY": item.get("category", ""),
+                "EMAIL": email,
+                "URL": item.get("url", ""),
+                "USERNAME": username_value,
+                "PASSWORD": item.get("password", ""),
+                "ADDED_AT": item.get("added_at", ""),
+            }
+
+            for key in row_data.keys():
+                if key not in all_columns:
+                    all_columns.append(key)
+
+            is_email_hint = item.get("is_email", True)
+            row_data.update(
+                enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
+            )
+            all_rows.append(row_data)
+
+    return all_rows, all_columns, total_points
+
+
 def build_headers(columns: list[str]) -> list[str]:
     ordered_headers = [
         "DOMAIN",
@@ -562,6 +662,8 @@ def build_headers(columns: list[str]) -> list[str]:
     ]
     if "IP" in columns:
         ordered_headers.insert(2, "IP")
+    if "EMAIL" in columns:
+        ordered_headers.insert(2, "EMAIL")
     headers = [h for h in ordered_headers if h in ordered_headers]
     extra_columns = [c for c in columns if c not in headers]
     headers.extend(extra_columns)
@@ -632,15 +734,24 @@ def main() -> int:
         elif args.ip:
             ip_filters = [args.ip.strip()]
 
+        email_filters: list[str] | None = None
+        if args.email_list:
+            email_filters = read_email_list(Path(args.email_list).expanduser().resolve())
+        elif args.email:
+            email_filters = [args.email.strip()]
+
         if args.folder:
             folder = Path(args.folder).expanduser().resolve()
-        elif not domain_filters and not ip_filters:
+        elif not domain_filters and not ip_filters and not email_filters:
             default_folder = Path.cwd() / "files"
             folder = default_folder if default_folder.exists() else Path.cwd()
 
         if folder is not None:
             if ip_filters:
                 print("Error: IP search is API-only. Omit -ff for IP mode.", file=sys.stderr)
+                return 1
+            if email_filters:
+                print("Error: Email search is API-only. Omit -ff for email mode.", file=sys.stderr)
                 return 1
             if not folder.exists() or not folder.is_dir():
                 print(f"Error: Folder not found or not a directory: {folder}", file=sys.stderr)
@@ -661,11 +772,22 @@ def main() -> int:
                 print(f"Done: merged {len(rows)} rows from CSVs.")
             return 0
 
-        if not domain_filters and not ip_filters:
-            print("Error: Provide -ff for CSV mode or -d/-dl/-i/-il for API mode.", file=sys.stderr)
+        active_modes = sum([
+            bool(domain_filters),
+            bool(ip_filters),
+            bool(email_filters),
+        ])
+        if active_modes == 0:
+            print(
+                "Error: Provide -ff for CSV mode or -d/-dl/-i/-il/-e/-el for API mode.",
+                file=sys.stderr,
+            )
             return 1
-        if domain_filters and ip_filters:
-            print("Error: Choose either domain search (-d/-dl) or IP search (-i/-il), not both.", file=sys.stderr)
+        if active_modes > 1:
+            print(
+                "Error: Choose only one search mode: domain (-d/-dl), IP (-i/-il), or email (-e/-el).",
+                file=sys.stderr,
+            )
             return 1
 
         api_key = read_api_key(Path(args.key).expanduser().resolve())
@@ -674,14 +796,21 @@ def main() -> int:
                 domain_filters, api_key, args.auto_unlock
             )
             summary = f"{len(domain_filters)} domain(s)"
-        else:
+            if len(domain_filters) > 1:
+                write_report_by_domain(output, rows, columns)
+            else:
+                write_report(output, rows, columns)
+        elif ip_filters:
             rows, columns, points_consumed = build_report_from_ip(
-                ip_filters or [], api_key, args.auto_unlock
+                ip_filters, api_key, args.auto_unlock
             )
-            summary = f"{len(ip_filters or [])} IP(s)"
-        if domain_filters and len(domain_filters) > 1:
-            write_report_by_domain(output, rows, columns)
+            summary = f"{len(ip_filters)} IP(s)"
+            write_report(output, rows, columns)
         else:
+            rows, columns, points_consumed = build_report_from_email(
+                email_filters or [], api_key, args.auto_unlock
+            )
+            summary = f"{len(email_filters or [])} email(s)"
             write_report(output, rows, columns)
 
         if args.auto_unlock:
