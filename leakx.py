@@ -298,6 +298,39 @@ def fetch_ip_leaks(ip: str, api_key: str, auto_unlock: bool) -> tuple[list[dict]
     all_items: list[dict] = []
     points_consumed = 0
 
+    if auto_unlock:
+        # Walk all pages to trigger auto-unlock on each page.
+        while True:
+            params = {"page": page, "page_size": page_size, "auto_unlock": True}
+            url = f"{API_BASE_URL}/search/advanced"
+            payload = {"url_host": [ip]}
+            if VERBOSE:
+                print(
+                    f"[ip] {ip} page={page} page_size={page_size} filter=url_host (auto_unlock)",
+                    file=sys.stderr,
+                )
+            response = requests.post(
+                url, headers=headers, params=params, json=payload, timeout=REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            points = data.get("auto_unlock_points_consumed")
+            if isinstance(points, int):
+                points_consumed += points
+
+            items = data.get("items", [])
+            total = data.get("total")
+            if total is not None and (page * page_size) >= total:
+                break
+            if not items or len(items) < page_size:
+                break
+            page += 1
+
+        # After auto-unlock, fetch only unlocked items using the unlocked endpoint.
+        unlocked_items = fetch_unlocked_advanced({"url_host": [ip]}, api_key)
+        return unlocked_items, points_consumed
+
     while True:
         params = {"page": page, "page_size": page_size}
         if auto_unlock:
@@ -332,6 +365,38 @@ def fetch_ip_leaks(ip: str, api_key: str, auto_unlock: bool) -> tuple[list[dict]
         page += 1
 
     return all_items, points_consumed
+
+
+def fetch_unlocked_advanced(filters: dict, api_key: str) -> list[dict]:
+    headers = {"Authorization": f"Bearer {api_key}"}
+    page = 1
+    page_size = 1000
+    all_items: list[dict] = []
+
+    while True:
+        params = {"page": page, "page_size": page_size}
+        for key, value in (filters or {}).items():
+            params[key] = value
+
+        url = f"{API_BASE_URL}/profile/unlocked/advanced"
+        if VERBOSE:
+            print(f"[advanced-unlocked] page={page} page_size={page_size}", file=sys.stderr)
+        response = requests.get(url, headers=headers, params=params, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+
+        items = data.get("items", [])
+        all_items.extend(items)
+
+        total = data.get("total")
+        if total is not None and len(all_items) >= total:
+            break
+        if not items or len(items) < page_size:
+            break
+
+        page += 1
+
+    return all_items
 
 
 def fetch_password_hashes(password: str, api_key: str) -> list[dict]:
@@ -648,7 +713,11 @@ def build_report_from_csv(
             row_data.update(row)
 
             username_value = row.get("USERNAME", "")
-            row_data.update(enrich_username_field(username_value, cache))
+            lookup = enrich_username_field(username_value, cache)
+            row_data.update(lookup)
+            for key in lookup.keys():
+                if key not in all_columns:
+                    all_columns.append(key)
             all_rows.append(row_data)
 
     return all_rows, all_columns
@@ -683,9 +752,11 @@ def build_report_from_api(
                     all_columns.append(key)
 
             is_email_hint = item.get("is_email")
-            row_data.update(
-                enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
-            )
+            lookup = enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
+            row_data.update(lookup)
+            for key in lookup.keys():
+                if key not in all_columns:
+                    all_columns.append(key)
             all_rows.append(row_data)
 
     return all_rows, all_columns, total_points
@@ -721,9 +792,11 @@ def build_report_from_ip(
                     all_columns.append(key)
 
             is_email_hint = item.get("is_email")
-            row_data.update(
-                enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
-            )
+            lookup = enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
+            row_data.update(lookup)
+            for key in lookup.keys():
+                if key not in all_columns:
+                    all_columns.append(key)
             all_rows.append(row_data)
 
     return all_rows, all_columns, total_points
@@ -759,9 +832,11 @@ def build_report_from_email(
                     all_columns.append(key)
 
             is_email_hint = item.get("is_email", True)
-            row_data.update(
-                enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
-            )
+            lookup = enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
+            row_data.update(lookup)
+            for key in lookup.keys():
+                if key not in all_columns:
+                    all_columns.append(key)
             all_rows.append(row_data)
 
     return all_rows, all_columns, total_points
@@ -798,9 +873,11 @@ def build_report_from_username(
                     all_columns.append(key)
 
             is_email_hint = item.get("is_email", False)
-            row_data.update(
-                enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
-            )
+            lookup = enrich_username_field(username_value, cache, is_email_hint=is_email_hint)
+            row_data.update(lookup)
+            for key in lookup.keys():
+                if key not in all_columns:
+                    all_columns.append(key)
             all_rows.append(row_data)
 
     return all_rows, all_columns, total_points
